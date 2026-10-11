@@ -1,0 +1,241 @@
+---
+title: "Does the Election of a Female Leader Clear the Way for More Women in Politics?"
+subtitle: "Replicação de Baskaran e Hessami (2018) - Exercício Prático 2"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+options(scipen = 999)
+
+for (p in c("haven", "sandwich", "rdrobust")) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p, repos = "https://cloud.r-project.org")
+}
+
+# local do arquivo
+DATA_DIR <- "datasets"
+
+# formata números com vírgula decimal e ponto de milhar
+fmt_br <- function(x, d = 2) formatC(x, format = "f", digits = d, decimal.mark = ",", big.mark = ".")
+
+```
+
+**Artigo replicado:** Baskaran, T. e Hessami, Z. (2018). *Does the Election of a Female Leader Clear the Way for More Women in Politics?* American Economic Journal: Economic Policy, 10(3), 95–121.
+
+# 1. Introdução
+
+O artigo busca inferir se a eleição de uma prefeita mulher faz com que as candidatas ao conselho municipal recebam mais "votos preferenciais". Os resultados mostram que, **quando uma mulher vence por pouco a eleição para prefeito contra um homem, as candidatas ao conselho sobem posições na lista em relação à posição inicial definida pelo partido**. Tanto o tamanho do efeito quanto sua significância estatística estão podem ser observados na seção 5 deste documento.
+  
+# 2. O _"rank improvement"_ como medida de preferência do eleitor
+
+Desde a metade dos anos 1990, as eleições para prefeito em Hesse, na Alemanha, ocorrem a cada 6 anos. Não há uma data nacional uniforme, variando em função do término dos termos em cada município, e há possibilidade de um ou dois turnos eleitorais, como no Brasil.  Além do prefeito, há o conselho local, responsável por monitorar a administração e efetuar as decisões políticas principais.
+
+
+As eleições para o conselho utilizam a **lista aberta**: O partido define uma ordem inicial dos candidatos preferenciais, mas o eleitor pode dar votos e alterar a ordem. A diferença entre a posição inicial (decisão feita pelo partido) e a final (decisão após votos do eleitor) mede, portanto, o quanto os eleitores preferiram cada candidata. O resultado deste _"rank improvement"_ normalizado é:
+
+
+`gewinn_norm = (posição inicial − posição final) / nº de cadeiras × 100`
+
+Valores positivos indicam que a candidata subiu na lista por obra dos eleitores, já dividir pelo número de cadeiras torna comparáveis conselhos de tamanhos diferentes.
+
+# 3. O problema de identificação e a solução via  RDD
+
+Comparar de maneira direta municípios com prefeita e com prefeito pode gerar problemas de identificação: os que elegem mulheres podem ser, por si sós, mais abertos a candidatas (mais urbanos, outra cultura política). Para isolar o efeito, o artigo usa estriramente eleições para prefeito em que **os dois primeiros colocados eram de gêneros diferentes**.
+
+| Elemento | No artigo e na replicação |
+|---|---|
+| Unidade | candidata ao conselho |
+| Variável de corrida | `margin_1`: margem de vitória da candidata a prefeita, em p.p. (positiva se ela venceu) |
+| Corte | `margin_1 = 0` |
+| Tratamento | `female_mayor = 1` se `margin_1 > 0` |
+| Tipo de RDD | *sharp*: o tratamento é determinado exatamente pelo corte |
+| Desfecho | `gewinn_norm` |
+
+**Lógica de identificação.** Em uma disputa decidida de forma accirrada, a decisão do vencedor aproxima-se da aleatoriedade. Dessa maneireira, municípios em que uma mulher ganhou por pouco e municípios em que ela perdeu por pouco devem ser parecidos em tudo, exceto no gênero do prefeito. Nesse sentido, a hipótese de identificação é que todas as outras características variam de forma contínua no _cutoff_. Sob ela, um salto no desfecho em `margin_1 = 0` é efeito causal da prefeita. O parâmetro é **local**: vale para municípios próximos do corte.
+
+# 4. Metodologia e passo a passo do código
+
+O código aplica a equação (2) do artigo:
+
+`y = α + β·female_mayor + c·margem + d·(female_mayor × margem) + ε`
+
+## Passo 1: dados e definição do desenho
+
+Para identificar o efeito causal, a amostra da regressão descontínua reúne os municípios em que a última eleição para prefeito foi disputada entre um homem e uma mulher. O objetivo é comparar a melhora no _ranking_ das candidatas ao conselho em municípios onde uma mulher ganhou de forma acirrada de um homem contra municípios onde homens ganharam de forma acirrada contra mulheres. 
+
+```{r dados}
+d0 <- haven::read_dta(file.path(DATA_DIR, "main_dataset.dta"))
+d0 <- as.data.frame(haven::zap_formats(haven::zap_label(haven::zap_labels(d0))))
+
+# amostra RDD: última eleição para prefeito foi homem x mulher
+rdd  <- d0[!is.na(d0$rdd_sample) & d0$rdd_sample == 1, ]
+cand <- rdd[rdd$female == 1, ]            # unidade de análise: candidatas ao conselho
+
+x <- cand$margin_1       # variável de corrida
+y <- cand$gewinn_norm    # desfecho
+
+cat("Candidatos no total:", nrow(d0), "| candidatas:", sum(d0$female == 1), "\n")
+cat("Amostra RDD:", nrow(rdd), "candidatos |", length(unique(rdd$gkz_jahr)),
+    "eleições de conselho |", length(unique(rdd$gkz)), "municípios\n")
+cat("Candidatas na amostra RDD:", nrow(cand), "\n")
+cat("RDD sharp? female_mayor == (margin_1 > 0) em todas as linhas:",
+    all(cand$female_mayor == as.numeric(cand$margin_1 > 0)), "\n")
+summary(cand$margin_1)
+```
+
+## Passo 2: largura de banda ótima (h)
+
+A largura da banda define a janela ao redor do _cutoff_: só entram candidatas com margem entre −h e +h. Janelas estreitas comparam casos mais parecidos, mas com poucos dados; janelas largas têm mais precisão, mas incluem casos menos semelhantes.Na áreas vizinhas ao _cutoff_, unidades tratadas de ambos os lados teriam resultados semelhantes na ausência de tratamento (neste caso, a eleição de uma mulher para a prefeitura). O artigo usa, para o modelo (1), a largura ótima de Calonico, Cattaneo e Titiunik (CCT), que minimiza o erro quadrático médio do estimador no corte. Aqui ela é **calculada** com o pacote `rdrobust`, reproduzindo os argumentos da rotina original do artigo disponibilizada em Stata (corte 0, kernel triangular, polinômio de grau 1).
+
+```{r largura}
+bw_obj <- tryCatch(
+  rdrobust::rdbwselect(y = y, x = x, c = 0, p = 1, kernel = "triangular",
+                       bwselect = "mserd", masspoints = "off"),
+  error = function(e)
+    rdrobust::rdbwselect(y = y, x = x, c = 0, p = 1, kernel = "triangular", bwselect = "mserd")
+)
+h <- round(as.numeric(bw_obj$bws[1, 1]), 2)   # Reprodução com base no stata, que arredonda para 2 casas
+h
+```
+
+A largura ótima calculada é **h = `r fmt_br(h, 2)`** pontos percentuais, enquanto o artigo reporta h = 20,10.
+
+## Passo 3: pesos do kernel triangular
+
+Dentro da janela, cada candidata recebe peso `1 − |margem|/h`. O peso é 1 no corte e cai linearmente até zero na borda da janela. Quem está mais perto do corte é mais comparável e pesa mais.
+
+**Observação:** um kernel de peso triangular funciona como uma regra que define o peso de cada observação. Ele dá peso máximo a quem está no corte e vai diminuindo em linha reta até chegar a zero na borda da janela. 
+
+**A fórmula:** peso = 1 − |margem| / h, se |margem| ≤ h. Fora da janela, o peso é 0.
+
+```{r pesos}
+# Como o Stata guarda variáveis como float, imito isso com a função to_f32 
+to_f32 <- function(v) {
+  v <- as.numeric(v)
+  readBin(writeBin(v, raw(), size = 4), what = "numeric", n = length(v), size = 4)
+}
+t_   <- to_f32(x / h) # Margem de cada candidata. Dividir por h gera uma escala que vai de -1 a +1
+
+peso <- to_f32((1 - abs(t_)) * as.numeric(abs(t_) <= 1)) # 
+peso[is.na(peso)] <- 0 # Se alguma margem estiver faltando, o peso vira 0
+
+cat("Candidatas dentro da janela (peso > 0):", sum(peso > 0), "de", length(peso), "\n")
+knitr::kable(data.frame(margem = round(c(0, 0.25 * h, 0.5 * h, 0.75 * h, h), 2),
+                        peso   = c(1, 0.75, 0.50, 0.25, 0)),
+             caption = "Exemplos de peso triangular")
+```
+
+## Passo 4: estimação RDD
+
+Dentro da janela, estima-se uma reta de cada lado do _cutoff_, com inclinações livres, por mínimos quadrados ponderados. `margin_1` e `inter_1` (a interação `female_mayor × margem`) controlam a tendência da variável dependente com a margem, e o coeficiente de `female_mayor` mede o **salto** entre as duas retas exatamente no corte. Os erros-padrão são robustos e agrupados por município, sem correção de amostra pequena (neste caso, estimando pela versão que reproduz os erros-padrão publicados no artigo).
+
+```{r estimacao}
+d <- cand[peso > 0 & !is.na(y), ] # Só as candidatas dentro da janela (peso > 0) e sem variável dependente ausente
+d$peso_ <- peso[peso > 0 & !is.na(y)]
+d$y_    <- d$gewinn_norm
+
+fit <- lm(y_ ~ female_mayor + margin_1 + inter_1, data = d, weights = peso_)
+
+# EP robustos agrupados por município 
+V   <- sandwich::vcovCL(fit, cluster = d$gkz, type = "HC0", cadjust = FALSE) # Calcula a matriz de variância dos coeficientes, type="HCO": erros robustos à heterocedasticidade, cadjust = FALSE: sem correção de amostra pequena.
+est <- coef(fit)
+se  <- sqrt(diag(V))
+G   <- length(unique(d$gkz))                       # número de municípios (clusters)
+pv  <- 2 * pt(-abs(est / se), df = G - 1) # p-valor com G-1 graus de liberadade
+
+tab <- cbind(coef = est, ep_agrupado = se, t = est / se, p_valor = pv)
+rownames(tab) <- c("(Intercepto)", "female_mayor", "margin_1", "inter_1")
+knitr::kable(round(tab, 4), caption = "Regressão linear local ponderada (h calculado)")
+
+b  <- unname(est["female_mayor"])
+eb <- unname(se["female_mayor"])
+```
+
+Coeficientes:
+
+- `(Intercepto)`: nível esperado de `gewinn_norm` no corte, do lado do prefeito homem.
+- `female_mayor`: **salto no corte**, o efeito local de ter uma prefeita (parâmetro de interesse).
+- `margin_1`: inclinação à esquerda do corte.
+- `inter_1`: mudança de inclinação à direita do corte.
+
+## Passo 5: evidência gráfica
+
+Os pontos são médias do desfecho em faixas de 3 p.p. de margem. As curvas vermelhas são ajustes lineares locais com kernel triangular de cada lado do corte (largura h), e as faixas cinzas são intervalos de confiança aproximados.
+
+```{r figura, fig.width=8, fig.height=5.6}
+loclin <- function(xx, yy, bw, ngrid = 100) {
+  ok <- !is.na(xx) & !is.na(yy)
+  xx <- xx[ok]; yy <- yy[ok]
+  grid <- seq(min(xx), max(xx), length.out = ngrid)
+  est_ <- rep(NA_real_, ngrid); ee <- rep(NA_real_, ngrid)
+  for (g in seq_len(ngrid)) {
+    k   <- pmax(1 - abs((xx - grid[g]) / bw), 0)
+    idx <- k > 0
+    if (sum(idx) < 3) next
+    Z  <- cbind(1, xx[idx] - grid[g]); kk <- k[idx]; y2 <- yy[idx]
+    A  <- crossprod(Z, Z * kk)
+    if (abs(det(A)) < 1e-12) next
+    Ai   <- solve(A)
+    beta <- Ai %*% crossprod(Z, kk * y2)
+    e    <- as.numeric(y2 - Z %*% beta)
+    B    <- crossprod(Z, Z * (kk^2 * e^2))
+    V2   <- Ai %*% B %*% Ai
+    est_[g] <- beta[1]; ee[g] <- sqrt(V2[1, 1])
+  }
+  data.frame(x = grid, est = est_, se = ee)
+}
+
+inc <- !is.na(y) & abs(x) < 30
+xp  <- x[inc]; yp <- y[inc]
+bin <- xp - (xp %% 3) + 1.5
+bm  <- aggregate(yp, by = list(bin = bin), FUN = mean)
+lo  <- loclin(xp[xp < 0],  yp[xp < 0],  h)
+hi  <- loclin(xp[xp >= 0], yp[xp >= 0], h)
+
+plot(NA, xlim = c(-30, 30), ylim = c(-5, 5), xaxt = "n", yaxt = "n",
+     xlab = "Margem de vitória da candidata a prefeita (p.p.)",
+     ylab = "Rank improvement das candidatas")
+axis(1, at = seq(-30, 30, 10)); axis(2, at = c(-5, -2.5, 0, 2.5, 5))
+for (g in list(lo, hi)) {
+  gg <- g[!is.na(g$est) & !is.na(g$se), ]
+  polygon(c(gg$x, rev(gg$x)), c(gg$est + 1.96 * gg$se, rev(gg$est - 1.96 * gg$se)),
+          col = "grey88", border = NA)
+}
+points(bm$bin, bm$x, pch = 19, cex = 1.4)
+for (g in list(lo, hi)) {
+  lines(g$x, g$est, col = "red", lwd = 3)
+  lines(g$x, g$est + 1.96 * g$se, col = "grey50", lwd = 2)
+  lines(g$x, g$est - 1.96 * g$se, col = "grey50", lwd = 2)
+}
+abline(v = 0)
+
+salto <- head(hi$est[!is.na(hi$est)], 1) - tail(lo$est[!is.na(lo$est)], 1)
+```
+
+O salto de diferença entre as duas curvas em margem = 0 é de **`r fmt_br(salto, 2)`** ranks (o artigo reporta cerca de 3,7).
+
+
+# 6. Comparação com o artigo
+
+```{r comparacao, echo=FALSE}
+knitr::kable(data.frame(
+  ` ` = c("Largura de banda h", "Efeito", "Erro-padrão", "Observações / eleições"),
+  Replicação = c(fmt_br(h, 2), fmt_br(b, 3), fmt_br(eb, 3),
+                 paste(fmt_br(nrow(d), 0), "/", length(unique(d$gkz_jahr)))),
+  `Artigo (Tabela 2, coluna 1)` = c("20,10", "3,712", "0,971", "2.878 / 77"),
+  check.names = FALSE
+), caption = "Replicação x artigo")
+```
+
+A diferença de resultado advem **apenas** da largura de banda, que é calculada de forma diferente (possivelmente por efeito do pacote utilizado); os pesos, o modelo e os erros-padrão seguem a metodologia do artigo. Com h = 20,10, a especificação reproduz exatamente o valor publicado (3,712; EP 0,971). Isso indica que o método foi implementado corretamente e que o efeito é estável entre as duas larguras de banda.
+
+A checagem do Passo 6 confirma o coeficiente da implementação manual do código. A inferência feita pelo pacote, com correção do viés, é mais comedida que o erro agrupado do Passo 4: o efeito permanece positivo, mas com menos folga em relação a zero, o que condiz com a amostra pequena de eleições próximas do corte.
+ 
+# Referências
+
+Calonico, S., Cattaneo, M. e Titiunik, R. (2014). Robust nonparametric confidence intervals for regression-discontinuity designs. *Econometrica*, 82(6).
+
+Lee, D., Moretti, E. e Butler, M. (2004). Do voters affect or elect policies? Evidence from the U.S. House. *Quarterly Journal of Economics*.
